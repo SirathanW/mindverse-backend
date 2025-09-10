@@ -30,7 +30,7 @@ ANTHROPIC_MODEL   = os.getenv("ANTHROPIC_MODEL", "claude-3-5-haiku-20241022").st
 HF_EMBED_TOKEN = os.getenv("HF_EMBED_TOKEN", "").strip()
 HF_EMBED_MODEL = os.getenv("HF_EMBED_MODEL", "intfloat/multilingual-e5-base").strip()
 
-PORT = int(os.getenv("PORT", "8080"))
+PORT = int(os.getenv("PORT", "10000"))
 
 if not HF_EMBED_TOKEN:
     print("[WARN] HF_EMBED_TOKEN is empty — /index และ /rag-chat จะ error จนกว่าจะตั้งค่า.")
