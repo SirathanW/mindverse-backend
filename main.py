@@ -18,12 +18,13 @@ import time
 from typing import List, Dict, Any, Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 
 # ===================== ENV =====================
+ANTRHOPIC_VERSION = "2023-06-01"  # ใช้คงเดิม
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
 ANTHROPIC_MODEL   = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514").strip()
 
@@ -42,7 +43,7 @@ app = FastAPI(title="MindVerse Proxy", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://b8f5f12f.mv-backend.pages.dev"],  # lock ให้แคบลงภายหลัง (เช่น http://localhost:3000, app scheme)
+    allow_origins=["https://b8f5f12f.mv-backend.pages.dev"],  # ปรับให้ตรง frontend ของคุณ
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -67,10 +68,7 @@ class RagPayload(BaseModel):
     session: Optional[str] = Field(default="rag", description="session id (แชร์ memory กับ /chat ได้)")
 
 # ===================== Store (In-Memory) =====================
-# เอกสารที่ทำ embedding แล้ว: [{"id": str, "text": str, "vec": List[float]}]
 VECTOR_STORE: List[Dict[str, Any]] = []
-
-# ความจำบทสนทนาต่อ session (เก็บล่าสุด ~10 ข้อความ)
 MEMORIES: Dict[str, List[Dict[str, str]]] = {}
 
 def push_memory(session: str, role: str, content: str, max_len: int = 10):
@@ -81,7 +79,6 @@ def push_memory(session: str, role: str, content: str, max_len: int = 10):
 
 # ===================== Utils =====================
 def cosine(a: List[float], b: List[float]) -> float:
-    # เลี่ยง numpy เพื่อความง่าย
     if not a or not b or len(a) != len(b):
         return 0.0
     dot = 0.0
@@ -98,21 +95,15 @@ def cosine(a: List[float], b: List[float]) -> float:
     return dot / (math.sqrt(na) * math.sqrt(nb))
 
 async def hf_embed(texts: List[str]) -> List[List[float]]:
-    """
-    เรียก HF Inference API เพื่อทำ embedding ด้วย model ที่กำหนดใน HF_EMBED_MODEL
-    ใช้ endpoint feature-extraction
-    """
     if not HF_EMBED_TOKEN:
         raise HTTPException(status_code=400, detail="HF_EMBED_TOKEN is missing on server")
 
-    # Inference API: https://api-inference.huggingface.co/pipeline/feature-extraction/{model}
     url = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{HF_EMBED_MODEL}"
     headers = {
         "Authorization": f"Bearer {HF_EMBED_TOKEN}",
         "Content-Type": "application/json"
     }
 
-    # ใส่เป็น batch ทีละรายการ (บางรุ่นรองรับ batch; ทำทีละชิ้นเพื่อความชัวร์)
     outs: List[List[float]] = []
     async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
         for t in texts:
@@ -121,13 +112,10 @@ async def hf_embed(texts: List[str]) -> List[List[float]]:
             if r.status_code >= 400:
                 raise HTTPException(status_code=502, detail=f"HuggingFace error: {r.text}")
             v = r.json()
-            # บางรุ่นคืนหลายมิติ (เช่น sequence x dim) → เอาค่าเฉลี่ยตามแกน sequence
             if isinstance(v, list) and v and isinstance(v[0], list):
-                # ถ้าเป็น [seq_len, dim] → average pooling
                 if isinstance(v[0][0], (int, float)):
                     dim = len(v[0])
                     seq_len = len(v)
-                    # average
                     pooled = [0.0] * dim
                     for row in v:
                         for j in range(dim):
@@ -143,28 +131,21 @@ async def hf_embed(texts: List[str]) -> List[List[float]]:
     return outs
 
 async def anthropic_chat(messages: List[Dict[str, str]], system: Optional[str] = None) -> str:
-    """
-    เรียก Anthropic Messages API
-    messages: [{"role": "user"/"assistant"/"system"(ไม่ใช้ใน body), "content": "..."}]
-    """
     if not ANTHROPIC_API_KEY:
         raise HTTPException(status_code=400, detail="ANTHROPIC_API_KEY is missing on server")
 
     url = "https://api.anthropic.com/v1/messages"
     headers = {
         "x-api-key": ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
+        "anthropic-version": ANTRHOPIC_VERSION,
         "content-type": "application/json",
     }
 
-    # แปลงเป็นรูปแบบของ Anthropic:
-    # - ไม่รองรับ role=system ใน list -> ใช้ "system": "<text>"
     conv = []
     for m in messages:
         role = m.get("role", "user")
         content = m.get("content", "")
         if role == "system":
-            # ข้าม เพราะจะใส่ใน system parameter ด้านล่าง
             continue
         conv.append({"role": role, "content": content})
 
@@ -181,7 +162,6 @@ async def anthropic_chat(messages: List[Dict[str, str]], system: Optional[str] =
         if r.status_code >= 400:
             raise HTTPException(status_code=502, detail=f"Anthropic API error: {r.text}")
         data = r.json()
-        # โครงสร้างโต้ตอบ: {"content":[{"type":"text","text":"..."}], ...}
         blocks = data.get("content", [])
         if not blocks:
             return "(no content)"
@@ -205,14 +185,20 @@ async def health():
         "ts": time.time(),
     }
 
-@app.post("/index")
-async def index_docs(payload: IndexPayload):
-    if not payload.items:
+# ---------- FIX 405: อนุญาตทั้ง GET และ POST ----------
+@app.api_route("/index", methods=["GET", "POST"])
+async def index_docs(request: Request, payload: Optional[IndexPayload] = Body(None)):
+    if request.method == "GET":
+        return {
+            "usage": "POST JSON to /index",
+            "example": {"items": [{"id": "doc1", "text": "เนื้อหา..."}]}
+        }
+    # POST flow เดิม
+    if not payload or not payload.items:
         raise HTTPException(status_code=400, detail="No items")
     texts = [it.text for it in payload.items]
     vecs = await hf_embed(texts)
     for it, v in zip(payload.items, vecs):
-        # ลบของเก่าที่ id ซ้ำ
         for i, old in enumerate(VECTOR_STORE):
             if old["id"] == it.id:
                 del VECTOR_STORE[i]
@@ -225,61 +211,59 @@ async def clear_index():
     VECTOR_STORE.clear()
     return {"ok": True, "store_size": 0}
 
-@app.post("/chat")
-async def chat(payload: ChatPayload):
-    """
-    แชตทั่วไป (ไม่มี RAG) + จำบริบทแบบสั้นตาม session
-    Flutter ส่ง: { "input": "สวัสดี", "session": "abc", "meta": {"lang":"th"} }
-    """
-    user = payload.input.strip()
-    if not user:
+# ---------- FIX 405: /chat ----------
+@app.api_route("/chat", methods=["GET", "POST"])
+async def chat(request: Request, payload: Optional[ChatPayload] = Body(None)):
+    if request.method == "GET":
+        return {
+            "usage": "POST JSON to /chat",
+            "example": {"input": "สวัสดี", "session": "default", "meta": {"lang": "th"}}
+        }
+
+    # POST flow เดิม
+    if not payload or not payload.input.strip():
         raise HTTPException(status_code=400, detail="input is empty")
 
+    user = payload.input.strip()
     session = payload.session or "default"
     lang = (payload.meta or {}).get("lang", "th")
     name = (payload.meta or {}).get("name", "MindVerse User")
 
-    # ความจำบทสนทนา
     history = MEMORIES.get(session, [])
-
-    # system prompt (ไทยตามต้องการ)
     system_prompt = (
         f"คุณคือ MindVerse AI Assistant ตอบเป็นภาษา { 'ไทย' if lang.lower().startswith('th') else lang } "
         "อย่างสุภาพ กระชับ และให้คุณค่าจริง ไม่แต่งเรื่อง ถ้าไม่ทราบให้บอกตรงๆ"
     )
 
     messages: List[Dict[str, str]] = []
-    # นำ history (user/assistant) ใส่
     for h in history[-8:]:
         messages.append({"role": h["role"], "content": h["content"]})
     messages.append({"role": "user", "content": user})
 
     reply = await anthropic_chat(messages, system=system_prompt)
-
-    # อัปเดตความจำ
     push_memory(session, "user", user)
     push_memory(session, "assistant", reply)
 
     return {"reply": reply, "session": session}
 
-@app.post("/rag-chat")
-async def rag_chat(payload: RagPayload):
-    """
-    แชต + อ้างอิงคลังความรู้ (RAG)
-    - สร้าง embedding ของคำถาม
-    - หาความคล้ายจาก VECTOR_STORE
-    - ส่ง context เข้าหา Claude
-    """
-    q = payload.query.strip()
-    if not q:
+# ---------- FIX 405: /rag-chat ----------
+@app.api_route("/rag-chat", methods=["GET", "POST"])
+async def rag_chat(request: Request, payload: Optional[RagPayload] = Body(None)):
+    if request.method == "GET":
+        return {
+            "usage": "POST JSON to /rag-chat",
+            "example": {"query": "ถามจากคลัง", "top_k": 4, "session": "rag"}
+        }
+
+    # POST flow เดิม
+    if not payload or not payload.query.strip():
         raise HTTPException(status_code=400, detail="query is empty")
     if not VECTOR_STORE:
         raise HTTPException(status_code=400, detail="No documents in index. Call /index first.")
 
-    # 1) ฝังคิวรี
+    q = payload.query.strip()
     qvec = (await hf_embed([q]))[0]
 
-    # 2) คำนวณ cosine แล้วเลือก top_k
     scored = []
     for doc in VECTOR_STORE:
         score = cosine(qvec, doc["vec"])
@@ -287,7 +271,6 @@ async def rag_chat(payload: RagPayload):
     scored.sort(key=lambda x: x[0], reverse=True)
     picks = [d for _, d in scored[:payload.top_k]]
 
-    # 3) รวม context
     context_blocks = []
     for i, d in enumerate(picks, 1):
         context_blocks.append(f"[{i}] ({d['id']}): {d['text']}")
