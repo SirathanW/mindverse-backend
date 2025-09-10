@@ -25,7 +25,7 @@ from pydantic import BaseModel, Field
 
 # ===================== ENV =====================
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
-ANTHROPIC_MODEL   = os.getenv("ANTHROPIC_MODEL", "claude-3-5-haiku-20241022").strip()
+ANTHROPIC_MODEL   = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514").strip()
 
 HF_EMBED_TOKEN = os.getenv("HF_EMBED_TOKEN", "").strip()
 HF_EMBED_MODEL = os.getenv("HF_EMBED_MODEL", "intfloat/multilingual-e5-base").strip()
