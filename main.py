@@ -28,7 +28,7 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
 ANTHROPIC_MODEL   = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514").strip()
 
 HF_EMBED_TOKEN = os.getenv("HF_EMBED_TOKEN", "").strip()
-HF_EMBED_MODEL = os.getenv("HF_EMBED_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2").strip()
+HF_EMBED_MODEL = os.getenv("HF_EMBED_MODEL", "intfloat/multilingual-e5-base").strip()
 
 PORT = int(os.getenv("PORT", "10000"))
 
