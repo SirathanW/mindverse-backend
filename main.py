@@ -42,7 +42,7 @@ app = FastAPI(title="MindVerse Proxy", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://b8f5f12f.mv-backend.pages.dev"],  # ปรับให้ตรง frontend ของคุณ
+    allow_origins=["https://601411bb.mv-backend.pages.dev"],  # ปรับให้ตรง frontend ของคุณ
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
