@@ -1,399 +1,319 @@
 # main.py
-# FastAPI proxy for MindVerse
-# - RAG ด้วย HF Embeddings (HF_EMBED_TOKEN / HF_EMBED_MODEL)
-# - Chat ด้วย Claude (ANTRHOPIC_VERSION / ANTHROPIC_API_KEY / ANTHROPIC_MODEL)
-# - CORS พร้อมสำหรับ Flutter/Web
-# รัน: uvicorn main:app --reload --port %PORT%  (ค่าเริ่มต้น 8080)
+# MindVerse Router Proxy (Auto-detect FastAPI/Gradio)
+# ENV:
+#   ROUTER_URL   (required)
+#   ROUTER_TYPE  ("fastapi" | "gradio" | "" -> auto)
+#   HF_TOKEN     (optional, ถ้า Router/Space เป็น private)
+#   ALLOW_ORIGINS (optional, comma-separated; default="*")
+#   PORT         (optional, default=10000)
+#
+# Run: uvicorn main:app --host 0.0.0.0 --port ${PORT:-10000}
 
 import os
-from dotenv import load_dotenv, find_dotenv
-
-# โหลด .env (รองรับทั้งกรณีรันจากรากโปรเจกต์หรือ IDE)
-dotenv_path = find_dotenv(usecwd=True)
-load_dotenv(dotenv_path)
-
-import math
-import re
+import json
 import time
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, Optional, Set
+
+from dotenv import load_dotenv, find_dotenv
+dotenv_path = find_dotenv(usecwd=True)
+if dotenv_path:
+    load_dotenv(dotenv_path)
 
 import httpx
-from fastapi import FastAPI, HTTPException, Body, Request, Path
+from fastapi import FastAPI, HTTPException, Body, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 # ===================== ENV =====================
-ANTRHOPIC_VERSION = "2023-06-01"  # ใช้คงเดิม
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
-ANTHROPIC_MODEL   = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514").strip()
+ROUTER_URL   = os.getenv("ROUTER_URL", "").rstrip("/")
+ROUTER_TYPE  = os.getenv("ROUTER_TYPE", "").strip().lower()  # "fastapi" | "gradio" | ""(auto)
+HF_TOKEN     = os.getenv("HF_TOKEN", "").strip()
+ALLOW_ORIGINS = os.getenv("ALLOW_ORIGINS", "*").strip()
+PORT         = int(os.getenv("PORT", "10000"))
 
-HF_EMBED_TOKEN = os.getenv("HF_EMBED_TOKEN", "").strip()
-HF_EMBED_MODEL = os.getenv("HF_EMBED_MODEL", "intfloat/multilingual-e5-base").strip()
-
-PORT = int(os.getenv("PORT", "10000"))
-
-if not HF_EMBED_TOKEN:
-    print("[WARN] HF_EMBED_TOKEN is empty — /index และ /rag-chat จะ error จนกว่าจะตั้งค่า.")
-if not ANTHROPIC_API_KEY:
-    print("[WARN] ANTHROPIC_API_KEY is empty — /chat และ /rag-chat จะเรียก Claude ไม่ได้.")
+if not ROUTER_URL:
+    raise RuntimeError("ENV ROUTER_URL is required")
 
 # ===================== FastAPI =====================
-app = FastAPI(title="MindVerse Proxy", version="1.1.0")
+app = FastAPI(title="MindVerse Router Proxy", version="2.0.2")
 
+allow_origins = (
+    [o.strip() for o in ALLOW_ORIGINS.split(",") if o.strip()]
+    if ALLOW_ORIGINS else ["*"]
+)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://601411bb.mv-backend.pages.dev"],  # ปรับให้ตรง frontend ของคุณ
+    allow_origins=allow_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ===================== Schemas (เดิม) =====================
-class IndexItem(BaseModel):
-    id: str = Field(..., description="รหัสเอกสารไม่ซ้ำ")
-    text: str = Field(..., description="เนื้อหา plain text สำหรับทำ embedding")
-
-class IndexPayload(BaseModel):
-    items: List[IndexItem]
-
+# ===================== Schemas =====================
 class ChatPayload(BaseModel):
-    input: str = Field(..., description="คำถาม/ข้อความจากผู้ใช้")
-    meta: Optional[Dict[str, Any]] = Field(default=None, description="เมตาข้อมูลเสริม (เช่น name/lang)")
-    session: Optional[str] = Field(default="default", description="session id สำหรับจำบริบท")
+    input: str = Field(..., description="ข้อความจากผู้ใช้")
+    meta: Optional[Dict[str, Any]] = Field(default=None)
+    session: Optional[str] = Field(default="default")
 
 class RagPayload(BaseModel):
-    query: str = Field(..., description="คำถาม")
+    query: str = Field(..., description="ข้อความ/คำถาม")
     top_k: int = Field(default=4, ge=1, le=10)
-    session: Optional[str] = Field(default="rag", description="session id (แชร์ memory กับ /chat ได้)")
+    session: Optional[str] = Field(default="rag")
 
-# ===================== Schemas (ใหม่สำหรับ RAG เพิ่มเติม) =====================
-class UrlIndexPayload(BaseModel):
-    urls: List[str] = Field(..., description="ลิงก์ข้อความ/เว็บเพจที่จะดึงมา index")
-    id_prefix: Optional[str] = Field(default="url", description="คำนำหน้าสำหรับ gen id อัตโนมัติ")
+# ===================== Router Detection =====================
+_detect_cache: Dict[str, Any] = {
+    "type": None,          # "fastapi" | "gradio" | "unknown"
+    "seen_paths": set(),   # เฉพาะ fastapi: รายการ paths
+    "last_probe_ok": False,
+    "ts": None,
+    "error": None
+}
 
-class SearchPayload(BaseModel):
-    query: str = Field(..., description="ข้อความค้นหา")
-    top_k: int = Field(default=5, ge=1, le=20)
+def _auth_headers() -> Dict[str, str]:
+    h = {"Content-Type": "application/json"}
+    if HF_TOKEN:
+        h["Authorization"] = f"Bearer {HF_TOKEN}"
+    return h
 
-# ===================== Store (In-Memory) =====================
-VECTOR_STORE: List[Dict[str, Any]] = []  # [{id, text, vec: List[float]}]
-MEMORIES: Dict[str, List[Dict[str, str]]] = {}  # ต่อ session
+async def detect_router() -> Dict[str, Any]:
+    # หากบังคับชนิดจาก ENV ให้เชื่อก่อน
+    if ROUTER_TYPE in ("fastapi", "gradio"):
+        _detect_cache.update({
+            "type": ROUTER_TYPE,
+            "seen_paths": set(),
+            "last_probe_ok": True,
+            "ts": time.time(),
+            "error": None
+        })
+        return _detect_cache
 
-def push_memory(session: str, role: str, content: str, max_len: int = 10):
-    arr = MEMORIES.setdefault(session, [])
-    arr.append({"role": role, "content": content})
-    if len(arr) > max_len:
-        del arr[0: len(arr)-max_len]
+    headers = _auth_headers()
+    async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+        # 1) FastAPI: /openapi.json
+        try:
+            r = await client.get(f"{ROUTER_URL}/openapi.json", headers=headers)
+            if r.status_code == 200:
+                try:
+                    j = r.json()
+                    if isinstance(j, dict) and "paths" in j:
+                        paths = set(j["paths"].keys())
+                        _detect_cache.update({
+                            "type": "fastapi",
+                            "seen_paths": paths,
+                            "last_probe_ok": True,
+                            "ts": time.time(),
+                            "error": None
+                        })
+                        return _detect_cache
+                except Exception as e:
+                    _detect_cache["error"] = f"openapi parse error: {e}"
+        except Exception as e:
+            _detect_cache["error"] = f"openapi.json probe: {e}"
 
-# ===================== Utils =====================
-def cosine(a: List[float], b: List[float]) -> float:
-    if not a or not b or len(a) != len(b):
-        return 0.0
-    dot = 0.0
-    na = 0.0
-    nb = 0.0
-    for i in range(len(a)):
-        x = float(a[i]); y = float(b[i])
-        dot += x * y
-        na += x * x
-        nb += y * y
-    if na <= 0 or nb <= 0:
-        return 0.0
-    return dot / (math.sqrt(na) * math.sqrt(nb))
+        # 2) Gradio: /config หรือ /info
+        for hint in ("/config", "/info"):
+            try:
+                r = await client.get(f"{ROUTER_URL}{hint}", headers=headers)
+                if r.status_code == 200:
+                    _detect_cache.update({
+                        "type": "gradio",
+                        "seen_paths": set(),
+                        "last_probe_ok": True,
+                        "ts": time.time(),
+                        "error": None
+                    })
+                    return _detect_cache
+            except Exception as e:
+                _detect_cache["error"] = f"gradio probe: {e}"
 
-def _strip_html(raw: str) -> str:
-    # ตัด tag ง่าย ๆ ให้เหลือข้อความ
-    txt = re.sub(r"(?is)<script.*?>.*?</script>", " ", raw)
-    txt = re.sub(r"(?is)<style.*?>.*?</style>", " ", txt)
-    txt = re.sub(r"(?s)<[^>]+>", " ", txt)
-    txt = re.sub(r"[ \t\r\f\v]+", " ", txt)
-    return re.sub(r"\n+", "\n", txt).strip()
+    _detect_cache.update({
+        "type": "unknown",
+        "seen_paths": set(),
+        "last_probe_ok": False,
+        "ts": time.time()
+    })
+    return _detect_cache
 
-async def hf_embed(texts: List[str]) -> List[List[float]]:
-    if not HF_EMBED_TOKEN:
-        raise HTTPException(status_code=400, detail="HF_EMBED_TOKEN is missing on server")
-
-    url = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{HF_EMBED_MODEL}"
-    headers = {
-        "Authorization": f"Bearer {HF_EMBED_TOKEN}",
-        "Content-Type": "application/json"
-    }
-
-    outs: List[List[float]] = []
+# ===================== Helpers =====================
+async def _post_json(url: str, payload: Dict[str, Any]) -> httpx.Response:
     async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
-        for t in texts:
-            data = {"inputs": t, "truncate": True}
-            r = await client.post(url, headers=headers, json=data)
-            if r.status_code >= 400:
-                raise HTTPException(status_code=502, detail=f"HuggingFace error: {r.text}")
-            v = r.json()
-            # [seq_len, dim] → average pooling
-            if isinstance(v, list) and v and isinstance(v[0], list):
-                if isinstance(v[0][0], (int, float)):
-                    dim = len(v[0]); seq_len = len(v)
-                    pooled = [0.0] * dim
-                    for row in v:
-                        for j in range(dim):
-                            pooled[j] += float(row[j])
-                    pooled = [x / float(seq_len) for x in pooled]
-                    outs.append(pooled)
-                else:
-                    raise HTTPException(status_code=500, detail="Unexpected embedding format")
-            elif isinstance(v, list) and v and isinstance(v[0], (int, float)):
-                outs.append([float(x) for x in v])
-            else:
-                raise HTTPException(status_code=500, detail="Invalid embedding response format")
-    return outs
+        return await client.post(url, headers=_auth_headers(), json=payload)
 
-async def anthropic_chat(messages: List[Dict[str, str]], system: Optional[str] = None) -> str:
-    if not ANTHROPIC_API_KEY:
-        raise HTTPException(status_code=400, detail="ANTHROPIC_API_KEY is missing on server")
+def _extract_text_from_router(resp_json: Any) -> str:
+    # รองรับหลายรูปแบบ response
+    if isinstance(resp_json, dict):
+        for key in ("reply", "text", "message", "output", "result"):
+            if key in resp_json and isinstance(resp_json[key], (str, int, float)):
+                return str(resp_json[key])
+        if "data" in resp_json:  # Gradio
+            data = resp_json["data"]
+            if isinstance(data, list) and data:
+                return data[0] if isinstance(data[0], str) else json.dumps(data[0], ensure_ascii=False)
+            return json.dumps(data, ensure_ascii=False)
+        if "prediction" in resp_json:  # บาง Space
+            return str(resp_json["prediction"])
+        return json.dumps(resp_json, ensure_ascii=False)
+    return str(resp_json)
 
-    url = "https://api.anthropic.com/v1/messages"
-    headers = {
-        "x-api-key": ANTHROPIC_API_KEY,
-        "anthropic-version": ANTRHOPIC_VERSION,
-        "content-type": "application/json",
-    }
+async def router_call_chat(user_text: str) -> str:
+    info = await detect_router()
+    rtype: str = info["type"] or "unknown"
+    paths: Set[str] = info["seen_paths"] or set()
 
-    conv = []
-    for m in messages:
-        role = m.get("role", "user"); content = m.get("content", "")
-        if role == "system":
+    if rtype == "fastapi":
+        if "/chat" in paths:
+            r = await _post_json(f"{ROUTER_URL}/chat", {"input": user_text, "meta": {"source": "mv-proxy"}})
+            if r.status_code < 400:
+                return _extract_text_from_router(r.json())
+        if "/rag-chat" in paths:
+            r = await _post_json(f"{ROUTER_URL}/rag-chat", {"query": user_text, "top_k": 4, "session": "auto"})
+            if r.status_code < 400:
+                return _extract_text_from_router(r.json())
+
+    if rtype == "gradio":
+        try:
+            r = await _post_json(f"{ROUTER_URL}/api/predict", {"data": [user_text]})
+            if r.status_code < 400:
+                return _extract_text_from_router(r.json())
+        except Exception:
+            pass
+        for ep, body in (
+            ("/chat", {"input": user_text}),
+            ("/rag-chat", {"query": user_text, "top_k": 4}),
+        ):
+            try:
+                r = await _post_json(f"{ROUTER_URL}{ep}", body)
+                if r.status_code < 400:
+                    return _extract_text_from_router(r.json())
+            except Exception:
+                continue
+
+    # Unknown: ไล่ทีละแบบ
+    for ep, body in (
+        ("/chat", {"input": user_text}),
+        ("/rag-chat", {"query": user_text, "top_k": 4}),
+        ("/api/predict", {"data": [user_text]}),
+    ):
+        try:
+            r = await _post_json(f"{ROUTER_URL}{ep}", body)
+            if r.status_code < 400:
+                return _extract_text_from_router(r.json())
+        except Exception:
             continue
-        conv.append({"role": role, "content": content})
 
-    payload = {
-        "model": ANTHROPIC_MODEL,
-        "max_tokens": 512,
-        "messages": conv
-    }
-    if system:
-        payload["system"] = system
+    raise HTTPException(status_code=502, detail="Router did not accept any known chat endpoints.")
 
-    async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
-        r = await client.post(url, headers=headers, json=payload)
-        if r.status_code >= 400:
-            raise HTTPException(status_code=502, detail=f"Anthropic API error: {r.text}")
-        data = r.json()
-        blocks = data.get("content", [])
-        if not blocks:
-            return "(no content)"
-        text_parts = []
-        for b in blocks:
-            if isinstance(b, dict) and b.get("type") == "text":
-                text_parts.append(b.get("text", ""))
-        return "\n".join([t for t in text_parts if t])
+async def router_call_rag(query_text: str, top_k: int = 4) -> str:
+    info = await detect_router()
+    rtype: str = info["type"] or "unknown"
+    paths: Set[str] = info["seen_paths"] or set()
 
-# ===================== Endpoints เดิม =====================
+    if rtype == "fastapi":
+        if "/rag-chat" in paths:
+            r = await _post_json(f"{ROUTER_URL}/rag-chat", {"query": query_text, "top_k": top_k, "session": "rag"})
+            if r.status_code < 400:
+                return _extract_text_from_router(r.json())
+        if "/chat" in paths:
+            r = await _post_json(f"{ROUTER_URL}/chat", {"input": query_text, "meta": {"mode": "rag-fallback"}})
+            if r.status_code < 400:
+                return _extract_text_from_router(r.json())
+
+    if rtype == "gradio":
+        try:
+            r = await _post_json(f"{ROUTER_URL}/api/predict", {"data": [query_text]})
+            if r.status_code < 400:
+                return _extract_text_from_router(r.json())
+        except Exception:
+            pass
+        for ep, body in (
+            ("/rag-chat", {"query": query_text, "top_k": top_k}),
+            ("/chat", {"input": query_text}),
+        ):
+            try:
+                r = await _post_json(f"{ROUTER_URL}{ep}", body)
+                if r.status_code < 400:
+                    return _extract_text_from_router(r.json())
+            except Exception:
+                continue
+
+    for ep, body in (
+        ("/rag-chat", {"query": query_text, "top_k": top_k}),
+        ("/chat", {"input": query_text}),
+        ("/api/predict", {"data": [query_text]}),
+    ):
+        try:
+            r = await _post_json(f"{ROUTER_URL}{ep}", body)
+            if r.status_code < 400:
+                return _extract_text_from_router(r.json())
+        except Exception:
+            continue
+
+    raise HTTPException(status_code=502, detail="Router did not accept any known RAG endpoints.")
+
+# ===================== Endpoints =====================
+@app.get("/")
+async def root():
+    return {"ok": True, "service": "MindVerse Router Proxy", "router_url": ROUTER_URL}
+
 @app.get("/health")
 async def health():
+    info = await detect_router()
     return {
         "ok": True,
-        "anthropic_model": ANTHROPIC_MODEL,
-        "anthropic_key": bool(ANTHROPIC_API_KEY),
-        "hf_embed_model": HF_EMBED_MODEL,
-        "hf_embed_key": bool(HF_EMBED_TOKEN),
-        "vector_store_count": len(VECTOR_STORE),
-        "mem_sessions": len(MEMORIES),
+        "router_url": ROUTER_URL,
+        "router_type_env": ROUTER_TYPE or "(auto)",
+        "router_type_detected": info["type"],
+        "seen_paths": sorted(list(info["seen_paths"])) if info["seen_paths"] else [],
+        "last_probe_ok": info["last_probe_ok"],
         "ts": time.time(),
     }
 
-# ---------- FIX 405: อนุญาตทั้ง GET และ POST ----------
-@app.api_route("/index", methods=["GET", "POST"])
-async def index_docs(request: Request, payload: Optional[IndexPayload] = Body(None)):
-    if request.method == "GET":
-        return {
-            "usage": "POST JSON to /index",
-            "example": {"items": [{"id": "doc1", "text": "เนื้อหา..."}]}
-        }
-    if not payload or not payload.items:
-        raise HTTPException(status_code=400, detail="No items")
-    texts = [it.text for it in payload.items]
-    vecs = await hf_embed(texts)
-    for it, v in zip(payload.items, vecs):
-        # ลบของเก่าที่ id ซ้ำ
-        for i, old in enumerate(VECTOR_STORE):
-            if old["id"] == it.id:
-                del VECTOR_STORE[i]
-                break
-        VECTOR_STORE.append({"id": it.id, "text": it.text, "vec": v})
-    return {"ok": True, "count": len(payload.items), "store_size": len(VECTOR_STORE)}
-
-@app.post("/clear-index")
-async def clear_index():
-    VECTOR_STORE.clear()
-    return {"ok": True, "store_size": 0}
-
-# ---------- FIX 405: /chat ----------
-@app.api_route("/chat", methods=["GET", "POST"])
-async def chat(request: Request, payload: Optional[ChatPayload] = Body(None)):
-    if request.method == "GET":
-        return {
-            "usage": "POST JSON to /chat",
-            "example": {"input": "สวัสดี", "session": "default", "meta": {"lang": "th"}}
-        }
-    if not payload or not payload.input.strip():
+@app.post("/chat")
+async def chat(payload: ChatPayload = Body(...)):
+    user = (payload.input or "").strip()
+    if not user:
         raise HTTPException(status_code=400, detail="input is empty")
+    text = await router_call_chat(user)
+    return {"reply": text, "session": payload.session}
 
-    user = payload.input.strip()
-    session = payload.session or "default"
-    lang = (payload.meta or {}).get("lang", "th")
-    # name = (payload.meta or {}).get("name", "MindVerse User")  # เก็บไว้ใช้ภายหลังได้
-
-    history = MEMORIES.get(session, [])
-    system_prompt = (
-        f"คุณคือ MindVerse AI Assistant ตอบเป็นภาษา { 'ไทย' if lang.lower().startswith('th') else lang } "
-        "อย่างสุภาพ กระชับ และให้คุณค่าจริง ไม่แต่งเรื่อง ถ้าไม่ทราบให้บอกตรงๆ"
-    )
-
-    messages: List[Dict[str, str]] = []
-    for h in history[-8:]:
-        messages.append({"role": h["role"], "content": h["content"]})
-    messages.append({"role": "user", "content": user})
-
-    reply = await anthropic_chat(messages, system=system_prompt)
-    push_memory(session, "user", user)
-    push_memory(session, "assistant", reply)
-
-    return {"reply": reply, "session": session}
-
-# ---------- FIX 405: /rag-chat (เดิม) ----------
-@app.api_route("/rag-chat", methods=["GET", "POST"])
-async def rag_chat(request: Request, payload: Optional[RagPayload] = Body(None)):
-    if request.method == "GET":
-        return {
-            "usage": "POST JSON to /rag-chat",
-            "example": {"query": "ถามจากคลัง", "top_k": 4, "session": "rag"}
-        }
-    if not payload or not payload.query.strip():
+@app.post("/rag-chat")
+async def rag_chat(payload: RagPayload = Body(...)):
+    q = (payload.query or "").strip()
+    if not q:
         raise HTTPException(status_code=400, detail="query is empty")
-    if not VECTOR_STORE:
-        raise HTTPException(status_code=400, detail="No documents in index. Call /index first.")
+    text = await router_call_rag(q, top_k=payload.top_k)
+    return {"reply": text, "session": payload.session}
 
-    q = payload.query.strip()
-    qvec = (await hf_embed([q]))[0]
+# Proxy generic -> Router (แนบ query string ครบ)
+@app.api_route("/router-proxy/{path:path}", methods=["GET","POST","PUT","PATCH","DELETE","OPTIONS","HEAD"])
+async def router_proxy(path: str, request: Request):
+    target = f"{ROUTER_URL}/{path}".rstrip("/")
+    if request.url.query:
+        target = f"{target}?{request.url.query}"
 
-    scored = []
-    for doc in VECTOR_STORE:
-        score = cosine(qvec, doc["vec"])
-        scored.append((score, doc))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    picks = [d for _, d in scored[:payload.top_k]]
+    method = request.method.upper()
+    out_headers = dict(request.headers)
+    # ลบ header ที่ httpx จะจัดการเอง
+    for k in ("host", "content-length", "transfer-encoding"):
+        out_headers.pop(k, None)
 
-    context_blocks = []
-    for i, d in enumerate(picks, 1):
-        context_blocks.append(f"[{i}] ({d['id']}): {d['text']}")
-    context_text = "\n\n".join(context_blocks)
+    # บังคับ Content-Type หากต้นทางไม่ได้ส่งมา
+    if "content-type" not in {k.lower(): v for k, v in out_headers.items()}:
+        out_headers["Content-Type"] = "application/json"
 
-    system_prompt = (
-        "คุณคือผู้ช่วย MindVerse ตอบอย่างกระชับ ชัดเจน อ้างอิงความรู้จาก 'Context' ด้านล่างเป็นหลัก "
-        "ห้ามเดา ถ้าในบริบทไม่มีคำตอบ ให้บอกว่าไม่พบข้อมูล\n\n"
-        f"Context:\n{context_text}\n\n"
-        "แนวทางตอบ: สรุปประเด็นสำคัญสั้นๆ และอธิบายเพิ่มเฉพาะที่จำเป็น"
-    )
+    # ใช้ HF_TOKEN ถ้ามี (ทับของเดิม เพื่อความแน่นอน)
+    if HF_TOKEN:
+        out_headers["Authorization"] = f"Bearer {HF_TOKEN}"
 
-    messages = [{"role": "user", "content": q}]
-    answer = await anthropic_chat(messages, system=system_prompt)
-
-    return {
-        "reply": answer,
-        "references": [{"id": d["id"], "preview": d["text"][:160]} for d in picks]
-    }
-
-# ===================== RAG: Endpoints เพิ่มเติม (ใหม่) =====================
-
-@app.post("/search")
-async def search_docs(payload: SearchPayload):
-    """
-    ค้นหาเอกสารที่ใกล้เคียงที่สุดจาก VECTOR_STORE (ไม่เรียก Claude)
-    ใช้เพื่อ debug/ทดสอบ RAG ก่อนคุยจริง
-    """
-    if not payload.query.strip():
-        raise HTTPException(status_code=400, detail="query is empty")
-    if not VECTOR_STORE:
-        raise HTTPException(status_code=400, detail="No documents in index. Call /index first.")
-
-    qvec = (await hf_embed([payload.query.strip()]))[0]
-
-    scored = []
-    for doc in VECTOR_STORE:
-        s = cosine(qvec, doc["vec"])
-        scored.append((s, doc))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    top = scored[:payload.top_k]
-
-    return {
-        "count": len(top),
-        "results": [
-            {"id": d["id"], "score": float(s), "preview": d["text"][:200]}
-            for (s, d) in top
-        ]
-    }
-
-@app.get("/list-index")
-async def list_index():
-    """
-    ดูเอกสารทั้งหมดที่ index แล้ว (เพื่อความสะดวก)
-    """
-    return {
-        "size": len(VECTOR_STORE),
-        "items": [
-            {"id": d["id"], "preview": d["text"][:200]}
-            for d in VECTOR_STORE
-        ]
-    }
-
-@app.delete("/delete/{doc_id}")
-async def delete_doc(doc_id: str = Path(..., description="รหัสเอกสาร")):
-    for i, d in enumerate(VECTOR_STORE):
-        if d["id"] == doc_id:
-            del VECTOR_STORE[i]
-            return {"ok": True, "removed": doc_id, "store_size": len(VECTOR_STORE)}
-    raise HTTPException(status_code=404, detail="doc not found")
-
-@app.post("/index-urls")
-async def index_from_urls(payload: UrlIndexPayload):
-    """
-    ดึงข้อความจาก URL แล้วทำ embedding เก็บเข้าดัชนี
-    รองรับไฟล์ text ธรรมดา/markdown และเว็บเพจ (จะ strip HTML ให้)
-    """
-    if not payload.urls:
-        raise HTTPException(status_code=400, detail="No urls")
-
-    fetched_texts: List[str] = []
-    ids: List[str] = []
-    async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
-        for i, u in enumerate(payload.urls, start=1):
-            try:
-                r = await client.get(u)
-                if r.status_code >= 400:
-                    raise HTTPException(status_code=502, detail=f"fetch error {u}: {r.text}")
-                raw = r.text or ""
-                # ถ้าเป็นเว็บเพจ ให้ strip HTML
-                if "text/html" in r.headers.get("content-type", "").lower():
-                    text = _strip_html(raw)
-                else:
-                    text = raw
-                text = text.strip()
-                if not text:
-                    continue
-                fetched_texts.append(text)
-                ids.append(f"{payload.id_prefix}-{i}")
-            except Exception as e:
-                # ข้าม URL ที่พัง แล้วไปต่อ URL ถัดไป
-                print(f"[index-urls] skip {u}: {e}")
-
-    if not fetched_texts:
-        raise HTTPException(status_code=400, detail="No text fetched from urls")
-
-    vecs = await hf_embed(fetched_texts)
-    for _id, t, v in zip(ids, fetched_texts, vecs):
-        # ถ้ามี id ซ้ำ ให้ลบก่อน
-        for i, old in enumerate(VECTOR_STORE):
-            if old["id"] == _id:
-                del VECTOR_STORE[i]
-                break
-        VECTOR_STORE.append({"id": _id, "text": t, "vec": v})
-
-    return {"ok": True, "added": len(ids), "store_size": len(VECTOR_STORE), "ids": ids}
+    try:
+        body = await request.body()
+        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
+            r = await client.request(method, target, headers=_auth_headers() | out_headers, content=body or None)
+            return Response(
+                content=r.content,
+                status_code=r.status_code,
+                media_type=r.headers.get("content-type", "application/octet-stream"),
+            )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"proxy error: {e}")
+        
